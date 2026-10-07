@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling>=1.25,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "wikipulse"
+version = "0.1.0"
+description = "Live Wikipedia edit anomaly detection on Kafka, Spark, and Iceberg"
+requires-python = ">=3.11"
+dependencies = [
+  "confluent-kafka==2.11.1",
+  "fastapi==0.116.1",
+  "httpx==0.28.1",
+  "uvicorn==0.35.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest==8.4.1", "ruff==0.12.9"]
+
+[project.scripts]
+wikipulse = "wikipulse.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/wikipulse"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The editable-install .pth can be skipped when macOS marks it hidden (Python 3.13+).
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["E501", "UP017", "UP038"]

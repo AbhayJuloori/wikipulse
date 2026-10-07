@@ -1,0 +1,12 @@
+.env
+.venv/
+.git/
+data/
+warehouse/
+checkpoints/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+web/node_modules/
+web/dist/

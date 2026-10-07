@@ -1,0 +1,5 @@
+FROM apache/spark:4.0.4-scala2.13-java17-python3-ubuntu
+USER root
+WORKDIR /app
+ENV PYTHONPATH=/app/src
+COPY src /app/src
