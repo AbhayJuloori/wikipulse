@@ -56,6 +56,8 @@ export interface BatchStat {
   alertsUpserted: number;
 }
 
+export type Outcome = "accepted" | "duplicate" | "late";
+
 export interface EngineOptions {
   watermarkSeconds: number;
   lookbackSeconds: number;
@@ -97,6 +99,8 @@ export class PatrolEngine {
   alerts = new Map<string, Alert>();
   batches: BatchStat[] = [];
   lastCommitted: Edit[] = [];
+  /** Outcome of each arrival in the last commit, in offer order. */
+  lastOutcomes: Outcome[] = [];
   totals = { arrived: 0, accepted: 0, duplicates: 0, late: 0 };
 
   constructor(thresholds: Thresholds = DEFAULT_THRESHOLDS, options: Partial<EngineOptions> = {}) {
@@ -124,16 +128,21 @@ export class PatrolEngine {
     const accepted: Edit[] = [];
     let duplicates = 0;
     let late = 0;
+    const outcomes: Outcome[] = [];
     for (const edit of arrivals) {
       if (watermark !== null && edit.timestamp < watermark) {
         late += 1;
+        outcomes.push("late");
       } else if (this.seen.has(edit.eventId)) {
         duplicates += 1;
+        outcomes.push("duplicate");
       } else {
         this.seen.set(edit.eventId, edit.timestamp);
         accepted.push(edit);
+        outcomes.push("accepted");
       }
     }
+    this.lastOutcomes = outcomes;
     for (const edit of accepted) {
       if (this.maxEventTs === null || edit.timestamp > this.maxEventTs) this.maxEventTs = edit.timestamp;
     }
@@ -179,6 +188,13 @@ export class PatrolEngine {
       const latest = edits[edits.length - 1].timestamp;
       this.upsertAlert(edits, latest);
     }
+  }
+
+  /** Accepted edits for one page inside [from, to] event time. */
+  pageWindow(wiki: string, pageId: number, from: number, to: number): Edit[] {
+    return this.silver.filter(
+      (edit) => edit.wiki === wiki && edit.pageId === pageId && edit.timestamp >= from && edit.timestamp <= to,
+    );
   }
 
   private refreshAlerts(batch: Edit[]): number {

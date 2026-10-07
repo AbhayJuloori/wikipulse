@@ -33,6 +33,7 @@ describe("microbatch engine", () => {
     engine.offer(a);
     engine.offer(a);
     expect(engine.commit()).toMatchObject({ arrived: 2, accepted: 1, duplicates: 1 });
+    expect(engine.lastOutcomes).toEqual(["accepted", "duplicate"]);
     engine.offer(a);
     expect(engine.commit()).toMatchObject({ accepted: 0, duplicates: 1 });
     expect(engine.silver).toHaveLength(1);
@@ -121,5 +122,25 @@ describe("rules", () => {
     expect(scored.parts.map((p) => p.points)).toEqual([20, 25, 20, 12]);
     expect(scored.score).toBe(77);
     expect(scoreEdit(edit({ bot: true }), { ...DEFAULT_WEIGHTS, bot: -30 }).score).toBe(0);
+  });
+});
+
+describe("kafka partitioning", () => {
+  it("matches librdkafka consistent_random (crc32 % partitions) on keys from the broker", async () => {
+    const { crc32, partitionFor } = await import("../src/core/kafka");
+    expect(crc32("123456789")).toBe(0xcbf43926);
+    // Observed on the running broker (kafka-console-consumer --property print.partition=true).
+    const observed: [string, number][] = [
+      ["enwiki:2077495274", 0],
+      ["enwiki:2077495281", 0],
+      ["enwiki:2077495286", 0],
+      ["enwiki:2077495275", 1],
+      ["enwiki:2077495276", 1],
+      ["enwiki:2077495277", 1],
+      ["enwiki:2077495284", 2],
+      ["enwiki:2077495287", 2],
+      ["enwiki:2077495289", 2],
+    ];
+    for (const [key, partition] of observed) expect(partitionFor(key)).toBe(partition);
   });
 });

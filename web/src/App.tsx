@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { diffUrl, safeWikiUrl, type Edit } from "./core/contract";
-import { DEFAULT_THRESHOLDS, PatrolEngine, type Alert, type Thresholds } from "./core/engine";
+import type { Edit } from "./core/contract";
+import { DEFAULT_THRESHOLDS, PatrolEngine, type Thresholds } from "./core/engine";
 import { editWar, lateEdit } from "./core/hardcases";
-import { DEFAULT_WEIGHTS, scoreEdit, type Scored, type Weights } from "./core/score";
+import { anonymousKind, DEFAULT_WEIGHTS, revertMatch, scoreEdit, type Weights } from "./core/score";
 import {
   fetchPipeline,
   liveSource,
@@ -14,14 +14,20 @@ import {
   type SourceCounters,
   type SourceStatus,
 } from "./core/sources";
-import { BatchChart, type BatchBar } from "./ui/BatchChart";
-import { ago, fmt, kindLabel } from "./ui/format";
+import { Anatomy } from "./ui/Anatomy";
+import { clockTime, fmt } from "./ui/format";
 import { HowItWorks } from "./ui/HowItWorks";
+import { Incidents, type IncidentItem } from "./ui/Incidents";
+import { Ledger, type EditContext, type LedgerItem } from "./ui/Ledger";
+import { RuleDesk } from "./ui/RuleDesk";
+import { Seismograph, type CommitMark, type TapeItem } from "./ui/Seismograph";
 
 type Mode = "live" | "replay" | "pipeline";
+type Theme = "day" | "night";
 
 const TRIGGER_MS = 10_000;
-const QUEUE_SIZE = 25;
+const QUEUE_SIZE = 20;
+const TAPE_MS = 120_000;
 const CAPTURE_URL = `${import.meta.env.BASE_URL}sample/enwiki-capture.jsonl`;
 const WIKIS = [
   { value: "enwiki", label: "English Wikipedia" },
@@ -29,23 +35,28 @@ const WIKIS = [
   { value: "frwiki", label: "French Wikipedia" },
   { value: "eswiki", label: "Spanish Wikipedia" },
   { value: "jawiki", label: "Japanese Wikipedia" },
-  { value: "all", label: "All wikis (high volume)" },
+  { value: "all", label: "Every wiki (busy)" },
 ];
+const EMPTY_COUNTERS: SourceCounters = { messages: 0, edits: 0, filtered: 0, invalid: 0 };
 
-interface QueueItem {
-  edit: Edit;
-  scored: Scored;
+function readTheme(): Theme {
+  try {
+    const saved = localStorage.getItem("wikipulse-theme");
+    if (saved === "day" || saved === "night") return saved;
+  } catch {
+    /* storage unavailable: fall through to the system preference */
+  }
+  return window.matchMedia("(prefers-color-scheme: dark)").matches ? "night" : "day";
 }
-
-interface AlertItem extends Omit<Alert, "bucketTs" | "pageId" | "severity" | "edits" | "editors" | "revertHints" | "botEdits"> {}
 
 export function App() {
   const [mode, setMode] = useState<Mode>("live");
   const [wiki, setWiki] = useState("enwiki");
   const [speed, setSpeed] = useState(1);
   const [paused, setPaused] = useState(false);
+  const [theme, setTheme] = useState<Theme>(readTheme);
   const [status, setStatus] = useState<{ state: SourceStatus; detail?: string }>({ state: "connecting" });
-  const [counters, setCounters] = useState<SourceCounters>({ messages: 0, edits: 0, filtered: 0, invalid: 0 });
+  const [counters, setCounters] = useState<SourceCounters>(EMPTY_COUNTERS);
   const [hasPipeline, setHasPipeline] = useState(false);
   const [snapshot, setSnapshot] = useState<PipelineSnapshot | null>(null);
   const [weights, setWeights] = useState<Weights>(DEFAULT_WEIGHTS);
@@ -56,11 +67,23 @@ export function App() {
   const [, setTick] = useState(0);
   const [nextCommitAt, setNextCommitAt] = useState(Date.now() + TRIGGER_MS);
   const engineRef = useRef(new PatrolEngine());
+  const tapeRef = useRef<TapeItem[]>([]);
+  const pendingRef = useRef<TapeItem[]>([]);
+  const commitsRef = useRef<CommitMark[]>([]);
+  const seqRef = useRef(0);
   const pausedRef = useRef(paused);
   pausedRef.current = paused;
   const rerender = useCallback(() => setTick((n) => n + 1), []);
 
-  // Prefer the real pipeline when this page is served by the local FastAPI stack.
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    try {
+      localStorage.setItem("wikipulse-theme", theme);
+    } catch {
+      /* the preference is a convenience only */
+    }
+  }, [theme]);
+
   useEffect(() => {
     pipelineAvailable().then((available) => {
       setHasPipeline(available);
@@ -68,30 +91,47 @@ export function App() {
     });
   }, []);
 
-  // Source lifecycle: a fresh engine per source so modes never mix data.
+  const arrive = useCallback((edit: Edit) => {
+    engineRef.current.offer(edit);
+    const item: TapeItem = { seq: seqRef.current++, edit, arrivedAt: Date.now(), outcome: "pending" };
+    tapeRef.current.push(item);
+    pendingRef.current.push(item);
+  }, []);
+
+  // A fresh engine per source, so live, replay and pipeline data never mix.
   useEffect(() => {
     if (mode === "pipeline") return;
     engineRef.current = new PatrolEngine(thresholds);
-    setCounters({ messages: 0, edits: 0, filtered: 0, invalid: 0 });
+    tapeRef.current = [];
+    pendingRef.current = [];
+    commitsRef.current = [];
+    setCounters(EMPTY_COUNTERS);
     setExpanded(null);
     rerender();
     const handlers = {
       onEdit: (edit: Edit) => {
-        if (!pausedRef.current) engineRef.current.offer(edit);
+        if (!pausedRef.current) arrive(edit);
       },
       onStatus: (state: SourceStatus, detail?: string) => setStatus({ state, detail }),
       onCounters: setCounters,
     };
-    const source: EditSource =
-      mode === "live" ? liveSource(wiki, handlers) : replaySource(CAPTURE_URL, speed, handlers);
+    const source: EditSource = mode === "live" ? liveSource(wiki, handlers) : replaySource(CAPTURE_URL, speed, handlers);
     return () => source.stop();
   }, [mode, wiki, speed]);
 
-  // Microbatch trigger, like Spark's processingTime="10 seconds".
+  // The microbatch trigger, like Spark's processingTime = "10 seconds".
   useEffect(() => {
     if (mode === "pipeline") return;
     const commit = () => {
-      if (!pausedRef.current) engineRef.current.commit();
+      if (!pausedRef.current) {
+        const engine = engineRef.current;
+        const stat = engine.commit();
+        pendingRef.current.forEach((item, i) => (item.outcome = engine.lastOutcomes[i] ?? "accepted"));
+        pendingRef.current = [];
+        commitsRef.current = [...commitsRef.current, { id: stat.batchId, at: stat.committedAt }].slice(-40);
+        const floor = Date.now() - TAPE_MS;
+        tapeRef.current = tapeRef.current.filter((item) => item.arrivedAt >= floor);
+      }
       setNextCommitAt(Date.now() + TRIGGER_MS);
       rerender();
     };
@@ -127,68 +167,105 @@ export function App() {
 
   useEffect(() => {
     if (!notice) return;
-    const timer = window.setTimeout(() => setNotice(null), 9000);
+    const timer = window.setTimeout(() => setNotice(null), 12_000);
     return () => window.clearTimeout(timer);
   }, [notice]);
 
   const engine = engineRef.current;
   const pipeline = mode === "pipeline";
   const nowSeconds = Date.now() / 1000;
-
   const pipelineEdits = useMemo(() => (snapshot?.queue ?? []).map(silverRowToEdit), [snapshot]);
-  const sourceEdits = pipeline ? pipelineEdits : engine.silver;
-  const latestEvent = sourceEdits.length ? sourceEdits[sourceEdits.length - 1].timestamp : 0;
-  const latestTs = pipeline ? Math.max(0, ...pipelineEdits.map((e) => e.timestamp)) : latestEvent;
-  // Replay runs on a virtual event clock that can be ahead of wall time.
+  const edits = pipeline ? pipelineEdits : engine.silver;
+  const latestTs = edits.reduce((max, e) => Math.max(max, e.timestamp), 0);
+  // Replay runs on a virtual event clock that can run ahead of wall time.
   const clock = Math.max(nowSeconds, latestTs);
+  const commitCount = engine.batches.length;
 
-  const queue: QueueItem[] = useMemo(() => {
-    const windowStart = latestTs - 600;
-    return sourceEdits
-      .filter((edit) => edit.timestamp >= windowStart && !(hideBots && edit.bot))
-      .map((edit) => ({ edit, scored: scoreEdit(edit, weights) }))
-      .sort((a, b) => b.scored.score - a.scored.score || b.edit.timestamp - a.edit.timestamp)
-      .slice(0, QUEUE_SIZE);
-    // engine.silver is mutated in place by commits; batches.length tracks those commits.
-  }, [sourceEdits, sourceEdits.length, engine.batches, weights, hideBots, latestTs]);
+  const queue: LedgerItem[] = useMemo(
+    () =>
+      edits
+        .filter((edit) => edit.timestamp >= latestTs - 600 && !(hideBots && edit.bot))
+        .map((edit) => ({ edit, scored: scoreEdit(edit, weights) }))
+        .sort((a, b) => b.scored.score - a.scored.score || b.edit.timestamp - a.edit.timestamp)
+        .slice(0, QUEUE_SIZE),
+    // engine.silver is mutated in place by commits; commitCount tracks those commits.
+    [edits, edits.length, commitCount, weights, hideBots, latestTs],
+  );
 
-  const alerts: AlertItem[] = pipeline
-    ? (snapshot?.alerts ?? []).map((row) => ({
+  const recent = useMemo(
+    () => edits.filter((e) => e.timestamp >= latestTs - 300),
+    [edits, edits.length, commitCount, latestTs],
+  );
+  const pulse = useMemo(() => {
+    const n = recent.length || 1;
+    // Rate over the observed span (at least 10 s), so a young session is not under-counted.
+    const spanMinutes = Math.max(10, latestTs - (recent[0]?.timestamp ?? latestTs)) / 60;
+    return {
+      perMinute: pipeline
+        ? Math.round((snapshot?.metrics?.input_rows_per_second ?? 0) * 60)
+        : Math.round(recent.length / spanMinutes),
+      loggedOut: Math.round((100 * recent.filter((e) => anonymousKind(e.user)).length) / n),
+      reverts: Math.round((100 * recent.filter((e) => revertMatch(e.comment)).length) / n),
+      bots: Math.round((100 * recent.filter((e) => e.bot).length) / n),
+    };
+  }, [recent, pipeline, snapshot, latestTs]);
+
+  const hotPages = useMemo(() => {
+    const pages = new Map<string, { title: string; edits: number; editors: Set<string> }>();
+    for (const e of recent) {
+      const key = `${e.wiki}:${e.pageId}`;
+      const page = pages.get(key) ?? { title: e.title, edits: 0, editors: new Set<string>() };
+      page.edits += 1;
+      page.editors.add(e.user);
+      pages.set(key, page);
+    }
+    return [...pages.entries()]
+      .map(([key, p]) => ({ key, title: p.title, edits: p.edits, editors: p.editors.size }))
+      .filter((p) => p.edits > 1)
+      .sort((a, b) => b.edits - a.edits || b.editors - a.editors)
+      .slice(0, 6);
+  }, [recent]);
+
+  const context = (edit: Edit): EditContext => {
+    const page = edits.filter((e) => e.wiki === edit.wiki && e.pageId === edit.pageId && e.timestamp >= latestTs - 300);
+    return {
+      editorEdits: edits.filter((e) => e.user === edit.user && e.timestamp >= latestTs - 600).length,
+      pageEdits: page.length,
+      pageEditors: new Set(page.map((e) => e.user)).size,
+    };
+  };
+
+  const incidents: IncidentItem[] = pipeline
+    ? (snapshot?.alerts ?? []).slice(0, 8).map((row) => ({
         alertId: String(row.alert_id),
-        kind: String(row.kind) as Alert["kind"],
+        kind: String(row.kind) as IncidentItem["kind"],
         wiki: String(row.wiki),
         title: String(row.title),
         pageUrl: "",
         lastEventTs: Date.parse(String(row.last_event_ts)) / 1000,
         explanation: String(row.explanation),
         synthetic: false,
+        edits: null,
       }))
-    : [...engine.alerts.values()].sort((a, b) => b.lastEventTs - a.lastEventTs);
+    : [...engine.alerts.values()]
+        .sort((a, b) => b.lastEventTs - a.lastEventTs)
+        .slice(0, 8)
+        .map((a) => ({ ...a, edits: engine.pageWindow(a.wiki, a.pageId, a.lastEventTs - 300, a.lastEventTs) }));
 
-  const bars: BatchBar[] = pipeline
-    ? (snapshot?.throughput ?? []).map((point, i) => ({
-        id: (snapshot?.batch_id ?? 0) - (snapshot!.throughput.length - 1 - i),
-        at: Date.parse(point.at),
-        accepted: point.rows,
-        duplicates: 0,
-        late: 0,
-      }))
-    : engine.batches.map((b) => ({
-        id: b.batchId,
-        at: b.committedAt,
-        accepted: b.accepted,
-        duplicates: b.duplicates,
-        late: b.late,
-      }));
+  const tape = (): TapeItem[] =>
+    pipeline
+      ? pipelineEdits.map((edit, i) => ({ seq: i, edit, arrivedAt: edit.timestamp * 1000, outcome: "accepted" as const }))
+      : tapeRef.current;
+  const commits = (): CommitMark[] =>
+    pipeline
+      ? (snapshot?.throughput ?? []).map((p, i, all) => ({
+          id: (snapshot?.batch_id ?? 0) - (all.length - 1 - i),
+          at: Date.parse(p.at),
+        }))
+      : commitsRef.current;
 
-  const recent = engine.batches.slice(-6);
-  const perMinute = pipeline
-    ? Math.round((snapshot?.metrics?.input_rows_per_second ?? 0) * 60)
-    : recent.length
-      ? Math.round((recent.reduce((s, b) => s + b.accepted, 0) / recent.length) * 6)
-      : 0;
-  const ready = pipeline ? Boolean(snapshot?.generated_at) : engine.batches.some((b) => b.accepted > 0);
-  const secondsToCommit = Math.max(0, Math.ceil((nextCommitAt - Date.now()) / 1000));
+  const ready = pipeline ? Boolean(snapshot?.generated_at) : engine.totals.accepted > 0;
+  const lastBatches = [...engine.batches].reverse().slice(0, 7);
 
   const updateThresholds = (next: Thresholds) => {
     setThresholds(next);
@@ -198,64 +275,73 @@ export function App() {
   };
 
   const inject = (kind: "war" | "duplicate" | "late") => {
-    const eventNow = Math.max(Math.floor(Date.now() / 1000), engine.silver.at(-1)?.timestamp ?? 0);
+    const eventNow = Math.max(Math.floor(Date.now() / 1000), latestTs);
     if (kind === "war") {
-      editWar(wiki, eventNow).forEach((e) => engine.offer(e));
-      setNotice("Queued 4 simulated edits on one page: two editors, three revert summaries. Watch Alerts after the next commit.");
+      editWar(wiki, eventNow).forEach(arrive);
+      setNotice(
+        "Four simulated edits queued on one page: two editors, three revert summaries. They commit with the next microbatch and should open an edit-war incident.",
+      );
     } else if (kind === "duplicate") {
-      const redelivered = engine.lastCommitted;
-      redelivered.forEach((e) => engine.offer(e));
-      setNotice(`Re-delivered ${fmt(redelivered.length)} edits from batch #${engine.batches.at(-1)?.batchId ?? 0} with the same event ids, as a producer replay after a crash would. Expect amber duplicate bars and no new queue rows.`);
+      const again = engine.lastCommitted;
+      again.forEach(arrive);
+      setNotice(
+        `Batch #${engine.batches.at(-1)?.batchId ?? 0} re-sent: ${fmt(again.length)} edits with the same event ids, as a producer replay after a crash would send them. Expect rings on the duplicate lane and no new ledger rows.`,
+      );
     } else {
-      lateEdit(wiki, eventNow).forEach((e) => engine.offer(e));
-      setNotice("Queued an edit stamped one hour behind the stream. It is older than the 10-minute watermark, so the next batch drops it (purple bar).");
+      lateEdit(wiki, eventNow).forEach(arrive);
+      setNotice(
+        "One simulated edit stamped an hour behind the stream. The watermark trails the newest event by ten minutes, so the next commit drops it onto the late lane.",
+      );
     }
     rerender();
   };
 
-  const statusText = {
-    connecting: pipeline ? "Connecting to local pipeline" : "Connecting to Wikimedia",
-    live: pipeline ? "Live · Kafka → Spark → Iceberg" : mode === "live" ? "Live · Wikimedia EventStreams" : "Replaying recorded capture",
-    reconnecting: "Reconnecting",
-    ended: "Ended",
-    error: "Source unavailable",
-  }[status.state];
+  const wikiLabel = mode === "replay" ? "English Wikipedia" : (WIKIS.find((w) => w.value === wiki)?.label ?? wiki);
+  const statusLine = paused
+    ? "Paused"
+    : {
+        connecting: pipeline ? "Connecting to the local pipeline" : "Connecting to Wikimedia",
+        live: pipeline
+          ? "Live from Kafka → Spark → Iceberg"
+          : mode === "live"
+            ? "Live from Wikimedia EventStreams"
+            : `Replaying a recorded capture${speed > 1 ? ` at ${speed}×` : ""}`,
+        reconnecting: "Reconnecting",
+        ended: "Ended",
+        error: "Source unavailable",
+      }[status.state];
+  const date = new Date(clock * 1000);
 
   return (
-    <>
-      <header className="topbar">
-        <div className="brand">
+    <div className="page">
+      <header className="masthead">
+        <div className="mast-top">
+          <span className="mast-label">Live Wikipedia edit patrol</span>
+          <span className={`wire-status ${status.state === "live" && !paused ? "on" : ""}`}>
+            <i aria-hidden="true" />
+            {statusLine}
+            {status.detail && <em> · {status.detail}</em>}
+          </span>
+          <button className="theme" onClick={() => setTheme(theme === "day" ? "night" : "day")}>
+            {theme === "day" ? "Night desk" : "Day desk"}
+          </button>
+        </div>
+        <h1 className="nameplate">
           Wiki<span>Pulse</span>
+        </h1>
+        <div className="dateline">
+          <span>
+            {date.toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long", year: "numeric", timeZone: "UTC" })}
+          </span>
+          <span>{clockTime(clock)}</span>
+          <span>
+            {pipeline ? `Spark batch #${snapshot?.batch_id ?? "—"}` : `Microbatch #${engine.batches.at(-1)?.batchId ?? "—"}`}
+          </span>
         </div>
-        <div className="status" role="status">
-          <span className={`dot ${status.state === "live" && !paused ? "live" : ""}`} />
-          {paused ? "Paused" : statusText}
-          {status.detail && <em> · {status.detail}</em>}
-        </div>
-      </header>
-
-      <main>
-        <section className="hero">
-          <div>
-            <div className="eyebrow">Live Wikipedia edit patrol</div>
-            <h1>Which edits should a patroller check first?</h1>
-            <p>
-              Every edit to Wikipedia is published as a public event. WikiPulse ranks them for human review and flags pages
-              that look like edit wars or bursts. {
-                {
-                  pipeline: "This view reads the Spark + Iceberg pipeline running locally.",
-                  live: "This page connects your browser to the live stream and applies the same rules as the Spark pipeline.",
-                  replay: "This replays a 42-minute capture from the pipeline's Kafka topic through the same rules as the Spark job.",
-                }[mode]
-              }
-            </p>
-          </div>
-        </section>
-
-        <section className="controls" aria-label="Data source">
-          <div className="segmented" role="tablist">
+        <nav className="desk-nav" aria-label="Data source">
+          <div className="sources" role="tablist">
             <button role="tab" aria-selected={mode === "live"} onClick={() => setMode("live")}>
-              Live stream
+              Live wire
             </button>
             <button role="tab" aria-selected={mode === "replay"} onClick={() => setMode("replay")}>
               Recorded capture
@@ -266,211 +352,222 @@ export function App() {
               </button>
             )}
           </div>
-          {mode === "live" && (
-            <label className="field">
-              Wiki
-              <select value={wiki} onChange={(e) => setWiki(e.target.value)}>
+          <div className="nav-controls">
+            {mode === "live" && (
+              <select aria-label="Wiki" value={wiki} onChange={(e) => setWiki(e.target.value)}>
                 {WIKIS.map((w) => (
                   <option key={w.value} value={w.value}>
                     {w.label}
                   </option>
                 ))}
               </select>
-            </label>
-          )}
-          {mode === "replay" && (
-            <label className="field">
-              Speed
-              <select value={speed} onChange={(e) => setSpeed(Number(e.target.value))}>
+            )}
+            {mode === "replay" && (
+              <select aria-label="Replay speed" value={speed} onChange={(e) => setSpeed(Number(e.target.value))}>
                 {[1, 3, 10].map((s) => (
                   <option key={s} value={s}>
-                    {s}×
+                    {s}× speed
                   </option>
                 ))}
               </select>
-            </label>
-          )}
-          {!pipeline && (
-            <>
-              <button className="ghost" onClick={() => setPaused((p) => !p)}>
+            )}
+            {!pipeline && (
+              <button className="text-button" onClick={() => setPaused((p) => !p)}>
                 {paused ? "Resume" : "Pause"}
               </button>
-              <span className="trigger">
-                {paused ? "Commits paused" : `Next microbatch in ${secondsToCommit}s · ${fmt(engine.pendingCount)} arrivals buffered`}
-              </span>
-            </>
-          )}
-        </section>
-
-        <section className="cards">
-          <Kpi label="Accepted edits / min" value={ready ? fmt(perMinute) : "—"} detail={pipeline ? "Spark input rate" : "Average of last 6 microbatches"} />
-          <Kpi label="Top review score" value={queue[0] ? String(queue[0].scored.score) : "—"} detail="Transparent 0–100 ordering aid" />
-          <Kpi label="Active alerts" value={ready ? fmt(alerts.length) : "—"} detail="Edit war, edit burst, bot burst" />
-          {pipeline ? (
-            <Kpi label="Late rows dropped" value={fmt(snapshot?.metrics?.late_rows_dropped ?? 0)} detail="Latest Spark batch" />
-          ) : (
-            <Kpi
-              label="Duplicates · late dropped"
-              value={`${fmt(engine.totals.duplicates)} · ${fmt(engine.totals.late)}`}
-              detail={`${fmt(counters.messages)} stream messages · ${fmt(counters.invalid)} malformed`}
-            />
-          )}
-        </section>
-
-        {notice && (
-          <div className="notice" role="status">
-            {notice}
+            )}
           </div>
-        )}
+        </nav>
+      </header>
 
-        <section className="grid">
-          <div className="panel">
-            <div className="panel-head">
-              <h2>Review queue</h2>
-              <label className="toggle">
+      <main>
+        <section className="lede">
+          <h2>Which edits should a patroller check first?</h2>
+          <p className="dek">
+            {
+              {
+                live: "Your browser is reading Wikipedia's public change feed right now. Each edit is scored, batched every ten seconds and checked for edit wars, with the same rules as the WikiPulse Spark pipeline.",
+                replay: "A 42-minute capture from the pipeline's Kafka topic, replayed through the same rules. Useful when the live feed is quiet or blocked.",
+                pipeline: "Reading the Spark + Iceberg pipeline running on this machine. Scores are recomputed here so the rule desk still works.",
+              }[mode]
+            }
+          </p>
+          <dl className="pulse" aria-label="Last five minutes of stream time">
+            <div>
+              <dt>Edits / min</dt>
+              <dd>{ready ? fmt(pulse.perMinute) : "—"}</dd>
+            </div>
+            <div>
+              <dt>Logged out</dt>
+              <dd>{ready ? `${pulse.loggedOut}%` : "—"}</dd>
+            </div>
+            <div>
+              <dt>Revert-like</dt>
+              <dd>{ready ? `${pulse.reverts}%` : "—"}</dd>
+            </div>
+            <div>
+              <dt>Bots</dt>
+              <dd>{ready ? `${pulse.bots}%` : "—"}</dd>
+            </div>
+            <div>
+              <dt>Incidents</dt>
+              <dd className={incidents.length ? "hot" : ""}>{ready ? fmt(incidents.length) : "—"}</dd>
+            </div>
+          </dl>
+        </section>
+
+        <section className="wire-section" aria-labelledby="wire-title">
+          <header className="section-head">
+            <span className="kicker">The wire</span>
+            <h3 id="wire-title">Every arrival in the last 90 seconds</h3>
+          </header>
+          <Seismograph
+            tape={tape}
+            commits={commits}
+            weights={weights}
+            nextCommitAt={pipeline ? null : nextCommitAt}
+            paused={paused}
+            caption={
+              pipeline
+                ? "Plotted by event time from Spark's committed snapshot."
+                : "Ticks appear on arrival and settle when a commit accepts them."
+            }
+          />
+          {!pipeline && (
+            <div className="wire-tools">
+              <div className="commit-log">
+                <h4>Commit log</h4>
+                {lastBatches.length ? (
+                  <ol>
+                    {lastBatches.map((b) => (
+                      <li key={b.batchId}>
+                        <span>#{String(b.batchId).padStart(3, "0")}</span>
+                        <span>{clockTime(b.committedAt / 1000)}</span>
+                        <span>
+                          <b>{b.accepted}</b> in
+                        </span>
+                        <span className={b.duplicates ? "dup-n" : "zero"}>{b.duplicates} dup</span>
+                        <span className={b.late ? "late-n" : "zero"}>{b.late} late</span>
+                        <span className="wm">wm {b.watermark === null ? "unset" : clockTime(b.watermark)}</span>
+                      </li>
+                    ))}
+                  </ol>
+                ) : (
+                  <p className="empty">The first commit lands within ten seconds.</p>
+                )}
+              </div>
+              <div className="stress">
+                <h4>Stress the pipeline</h4>
+                <p>Each button injects labelled synthetic events into the same engine.</p>
+                <button onClick={() => inject("war")} disabled={!ready}>
+                  <b>Stage an edit war</b>
+                  <span>4 edits, 2 editors, 3 revert summaries</span>
+                </button>
+                <button onClick={() => inject("duplicate")} disabled={!engine.lastCommitted.length}>
+                  <b>Re-send the last batch</b>
+                  <span>Same ids again; dedupe should absorb them</span>
+                </button>
+                <button onClick={() => inject("late")} disabled={!ready}>
+                  <b>Deliver an edit an hour late</b>
+                  <span>Older than the 10-minute watermark</span>
+                </button>
+                {notice && (
+                  <p className="notice" role="status">
+                    {notice}
+                  </p>
+                )}
+              </div>
+            </div>
+          )}
+        </section>
+
+        <div className="columns">
+          <section className="col-main" aria-labelledby="ledger-title">
+            <header className="section-head with-tools">
+              <div>
+                <span className="kicker">Review ledger</span>
+                <h3 id="ledger-title">Top {QUEUE_SIZE} edits from the last ten minutes</h3>
+              </div>
+              <label className="check">
                 <input type="checkbox" checked={hideBots} onChange={(e) => setHideBots(e.target.checked)} /> Hide bots
               </label>
+            </header>
+            <div className="receipt-key" aria-hidden="true">
+              <span>
+                <i className="seg-base" /> base
+              </span>
+              <span>
+                <i className="seg-anon" /> logged out
+              </span>
+              <span>
+                <i className="seg-revert" /> revert-like summary
+              </span>
+              <span>
+                <i className="seg-size" /> bytes changed
+              </span>
+              <span>
+                <i className="seg-bot" /> bot penalty
+              </span>
             </div>
-            <p className="panel-note">Highest score first among edits from the last 10 minutes of stream time. Select an edit to see why it ranks there.</p>
-            {queue.length ? (
-              <ol className="queue">
-                {queue.map(({ edit, scored }) => {
-                  const open = expanded === edit.eventId;
-                  const page = safeWikiUrl(edit.pageUrl);
-                  const diff = safeWikiUrl(diffUrl(edit));
-                  return (
-                    <li key={edit.eventId} className={open ? "open" : ""}>
-                      <button className="row" aria-expanded={open} onClick={() => setExpanded(open ? null : edit.eventId)}>
-                        <span className={`score ${scored.score >= 45 ? "high" : ""}`}>{scored.score}</span>
-                        <span className="row-main">
-                          <span className="title">
-                            {edit.title}
-                            {edit.synthetic && <span className="sim">Simulated</span>}
-                          </span>
-                          <span className="meta">
-                            <span>{edit.wiki}</span>
-                            <span>{edit.user}</span>
-                            <span>{ago(edit.timestamp, clock)}</span>
-                            {edit.bot && <span>bot</span>}
-                          </span>
-                        </span>
-                      </button>
-                      {open && (
-                        <div className="why">
-                          <ul>
-                            {scored.parts.map((part) => (
-                              <li key={part.key}>
-                                <span>{part.label}</span>
-                                <b className={part.points < 0 ? "neg" : ""}>
-                                  {part.points > 0 ? "+" : ""}
-                                  {part.points}
-                                </b>
-                              </li>
-                            ))}
-                          </ul>
-                          {edit.comment && <p className="comment">“{edit.comment}”</p>}
-                          <div className="links">
-                            {diff && (
-                              <a href={diff} target="_blank" rel="noopener noreferrer">
-                                View diff ↗
-                              </a>
-                            )}
-                            {page && (
-                              <a href={page} target="_blank" rel="noopener noreferrer">
-                                Open page ↗
-                              </a>
-                            )}
-                          </div>
-                        </div>
-                      )}
-                    </li>
-                  );
-                })}
-              </ol>
-            ) : (
-              <div className="empty">
-                {status.state === "error"
-                  ? `Could not reach the source${status.detail ? ` (${status.detail})` : ""}. Try “Recorded capture”.`
+            <Ledger
+              items={queue}
+              clock={clock}
+              expanded={expanded}
+              onToggle={(id) => setExpanded(expanded === id ? null : id)}
+              context={context}
+              emptyText={
+                status.state === "error"
+                  ? `The source could not be reached${status.detail ? ` (${status.detail})` : ""}. Try the recorded capture.`
                   : pipeline
                     ? "Waiting for the first committed Spark batch."
-                    : "Collecting edits. The first microbatch commits within 10 seconds."}
-              </div>
-            )}
-          </div>
+                    : "Collecting edits. The first microbatch commits within ten seconds."
+              }
+            />
+          </section>
 
-          <div className="side">
-            <div className="panel">
-              <div className="panel-head">
-                <h2>Alerts</h2>
-                <span>5-minute event-time lookback</span>
-              </div>
-              {alerts.length ? (
-                <ul className="alerts">
-                  {alerts.slice(0, 8).map((alert) => {
-                    const link = safeWikiUrl(alert.pageUrl);
-                    return (
-                      <li key={alert.alertId}>
-                        <div className="alert-top">
-                          {link ? (
-                            <a href={link} target="_blank" rel="noopener noreferrer">
-                              {alert.title}
-                            </a>
-                          ) : (
-                            <strong>{alert.title}</strong>
-                          )}
-                          <span className={`tag ${alert.kind === "edit_war" ? "war" : ""}`}>{kindLabel(alert.kind)}</span>
-                        </div>
-                        <div className="meta">
-                          {alert.synthetic && <span className="sim">Simulated</span>}
-                          <span>{alert.wiki}</span>
-                          <span>{alert.explanation}</span>
-                          <span>{ago(alert.lastEventTs, clock)}</span>
-                        </div>
-                      </li>
-                    );
-                  })}
-                </ul>
+          <aside className="col-side">
+            <section aria-labelledby="incidents-title">
+              <header className="section-head">
+                <span className="kicker">Incidents</span>
+                <h3 id="incidents-title">Pages crossing a rule</h3>
+              </header>
+              <Incidents
+                items={incidents}
+                clock={clock}
+                emptyText={
+                  pipeline
+                    ? "Nothing has crossed a rule. `make replay` sends a fixture edit war through Kafka."
+                    : "Nothing has crossed a rule yet, which is the normal state. Stage an edit war above to see one."
+                }
+              />
+            </section>
+            <section aria-labelledby="hot-title">
+              <header className="section-head">
+                <span className="kicker">Busiest pages</span>
+                <h3 id="hot-title">Most edited in the last 5 minutes</h3>
+              </header>
+              {hotPages.length ? (
+                <ol className="hot">
+                  {hotPages.map((page) => (
+                    <li key={page.key}>
+                      <span className="hot-title">{page.title}</span>
+                      <span className="hot-bar">
+                        <i style={{ width: `${(page.edits / hotPages[0].edits) * 100}%` }} />
+                      </span>
+                      <span className="hot-n">
+                        {page.edits} edits · {page.editors} {page.editors === 1 ? "editor" : "editors"}
+                      </span>
+                    </li>
+                  ))}
+                </ol>
               ) : (
-                <div className="empty">
-                  No page has crossed a rule yet. Quiet is normal{pipeline ? "; `make replay` sends a fixture edit war through Kafka." : "; try “Stage an edit war” below."}
-                </div>
+                <p className="empty">No page has more than one edit in the window yet.</p>
               )}
-            </div>
+            </section>
+          </aside>
+        </div>
 
-            <div className="panel">
-              <div className="panel-head">
-                <h2>Microbatches</h2>
-                <span>{pipeline ? "Rows per Spark batch" : "Rows per 10-second commit"}</span>
-              </div>
-              <BatchChart bars={bars} showDropped={!pipeline} />
-            </div>
-
-            {!pipeline && (
-              <div className="panel">
-                <div className="panel-head">
-                  <h2>Try a hard case</h2>
-                  <span>Synthetic, clearly labelled</span>
-                </div>
-                <div className="cases">
-                  <button onClick={() => inject("war")} disabled={!ready}>
-                    <b>Stage an edit war</b>
-                    <span>Four reverting edits by two users on one page</span>
-                  </button>
-                  <button onClick={() => inject("duplicate")} disabled={!engine.lastCommitted.length}>
-                    <b>Re-deliver the last batch</b>
-                    <span>Same event ids again: dedupe should absorb them</span>
-                  </button>
-                  <button onClick={() => inject("late")} disabled={!ready}>
-                    <b>Send a late edit</b>
-                    <span>One hour behind the stream: past the watermark</span>
-                  </button>
-                </div>
-              </div>
-            )}
-          </div>
-        </section>
-
-        <Tuning
+        <RuleDesk
           weights={weights}
           thresholds={thresholds}
           onWeights={setWeights}
@@ -478,90 +575,46 @@ export function App() {
           thresholdsDisabled={pipeline}
         />
 
+        {!pipeline && (
+          <section className="anatomy-section" aria-labelledby="anatomy-title">
+            <header className="section-head">
+              <span className="kicker">Anatomy of this session</span>
+              <h3 id="anatomy-title">Where every message went, and where the real pipeline does the same work</h3>
+            </header>
+            <Anatomy
+              wikiLabel={wikiLabel}
+              c={{
+                messages: counters.messages,
+                edits: counters.edits,
+                matching: counters.edits - counters.filtered,
+                invalid: counters.invalid,
+                batches: commitCount,
+                accepted: engine.totals.accepted,
+                duplicates: engine.totals.duplicates,
+                late: engine.totals.late,
+                retained: engine.silver.length,
+                alerts: engine.alerts.size,
+              }}
+            />
+          </section>
+        )}
+
         <HowItWorks />
       </main>
-      <footer>
-        Edit data © Wikimedia contributors, via the public{" "}
-        <a href="https://wikitech.wikimedia.org/wiki/Event_Platform/EventStreams" target="_blank" rel="noopener noreferrer">
-          EventStreams
-        </a>{" "}
-        API. Scores and alerts are heuristic triage aids, not vandalism verdicts. ·{" "}
+
+      <footer className="colophon">
+        <span>
+          Edits © Wikipedia contributors, CC BY-SA, via{" "}
+          <a href="https://wikitech.wikimedia.org/wiki/Event_Platform/EventStreams" target="_blank" rel="noopener noreferrer">
+            Wikimedia EventStreams
+          </a>
+          .
+        </span>
+        <span>Scores and incidents are triage aids, not verdicts on any editor.</span>
         <a href="https://github.com/AbhayJuloori/wikipulse" target="_blank" rel="noopener noreferrer">
-          Source on GitHub
+          Source and pipeline on GitHub ↗
         </a>
       </footer>
-    </>
-  );
-}
-
-function Kpi({ label, value, detail }: { label: string; value: string; detail: string }) {
-  return (
-    <div className="card">
-      <div className="eyebrow">{label}</div>
-      <div className="value">{value}</div>
-      <div className="detail">{detail}</div>
     </div>
-  );
-}
-
-function Slider(props: { label: string; value: number; min: number; max: number; onChange: (v: number) => void; disabled?: boolean }) {
-  return (
-    <label className="slider">
-      <span>
-        {props.label} <b>{props.value > 0 && props.min < 0 ? `+${props.value}` : props.value}</b>
-      </span>
-      <input
-        type="range"
-        min={props.min}
-        max={props.max}
-        value={props.value}
-        disabled={props.disabled}
-        onChange={(e) => props.onChange(Number(e.target.value))}
-      />
-    </label>
-  );
-}
-
-function Tuning(props: {
-  weights: Weights;
-  thresholds: Thresholds;
-  onWeights: (w: Weights) => void;
-  onThresholds: (t: Thresholds) => void;
-  thresholdsDisabled: boolean;
-}) {
-  const { weights: w, thresholds: t } = props;
-  const changed = JSON.stringify(w) !== JSON.stringify(DEFAULT_WEIGHTS) || JSON.stringify(t) !== JSON.stringify(DEFAULT_THRESHOLDS);
-  return (
-    <section className="panel tuning">
-      <div className="panel-head">
-        <h2>Tune the rules</h2>
-        <button className="ghost small" disabled={!changed} onClick={() => {
-          props.onWeights(DEFAULT_WEIGHTS);
-          props.onThresholds(DEFAULT_THRESHOLDS);
-        }}>
-          Reset to pipeline defaults
-        </button>
-      </div>
-      <div className="tuning-grid">
-        <div>
-          <h3>Review score</h3>
-          <p className="panel-note">The queue re-ranks instantly. Defaults match the Spark job.</p>
-          <Slider label="Logged-out editor" value={w.anonymous} min={0} max={50} onChange={(v) => props.onWeights({ ...w, anonymous: v })} />
-          <Slider label="Revert hint in summary" value={w.revertHint} min={0} max={50} onChange={(v) => props.onWeights({ ...w, revertHint: v })} />
-          <Slider label="Size change cap" value={w.sizeCap} min={0} max={50} onChange={(v) => props.onWeights({ ...w, sizeCap: v })} />
-          <Slider label="Bot flag" value={w.bot} min={-30} max={0} onChange={(v) => props.onWeights({ ...w, bot: v })} />
-        </div>
-        <div>
-          <h3>Alert rules</h3>
-          <p className="panel-note">
-            {props.thresholdsDisabled ? "Alert thresholds run inside Spark in pipeline mode." : "Active alerts are recomputed over the current windows."}
-          </p>
-          <Slider label="Edit war: revert hints ≥" value={t.editWarReverts} min={1} max={8} disabled={props.thresholdsDisabled} onChange={(v) => props.onThresholds({ ...t, editWarReverts: v })} />
-          <Slider label="Edit burst: edits ≥" value={t.editBurstEdits} min={3} max={20} disabled={props.thresholdsDisabled} onChange={(v) => props.onThresholds({ ...t, editBurstEdits: v })} />
-          <Slider label="Edit burst: editors ≥" value={t.editBurstEditors} min={1} max={8} disabled={props.thresholdsDisabled} onChange={(v) => props.onThresholds({ ...t, editBurstEditors: v })} />
-          <Slider label="Bot burst: bot edits ≥" value={t.botBurstEdits} min={3} max={30} disabled={props.thresholdsDisabled} onChange={(v) => props.onThresholds({ ...t, botBurstEdits: v })} />
-        </div>
-      </div>
-    </section>
   );
 }

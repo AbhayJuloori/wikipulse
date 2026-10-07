@@ -8,9 +8,11 @@
 
 **[abhayjuloori.github.io/wikipulse](https://abhayjuloori.github.io/wikipulse/)** runs with no server. The page opens Wikimedia's CORS-enabled stream directly from the visitor's browser and applies the pipeline's contract, review score and alert rules, ported to TypeScript. A Python-generated parity suite checks the port against 1,500+ real captured edits. Visitors can:
 
-- watch a ranked review queue and open the score breakdown and Wikipedia diff for any edit;
+- watch **the wire**, a scrolling seismograph of every arrival: tick height is the review score, ticks settle when a 10-second microbatch commits them, and duplicates and late records fall onto their own lanes;
+- read a ranked review ledger where each score is drawn as its additive parts, and open any edit for its Kafka key and partition, dedupe id, page context and Wikipedia diff;
+- inspect incidents through a per-editor timeline of the five-minute window, so an edit war reads as alternating reverts;
 - switch wikis, or replay a 42-minute capture recorded from this pipeline's Kafka topic;
-- trigger hard cases: stage an edit war, re-deliver the last microbatch (dedupe), or send an edit an hour behind the watermark (late drop), then watch the 10-second microbatch chart;
+- trigger hard cases: stage an edit war, re-deliver the last microbatch (dedupe), or send an edit an hour behind the watermark (late drop), and follow them through the commit log and a stage-by-stage anatomy of the session;
 - re-weight the score and alert thresholds and see the queue re-rank.
 
 The browser engine is a teaching mirror, not the system of record. Kafka, Spark and Iceberg remain the production path below, and the same UI switches to a **Local pipeline** mode when FastAPI serves it.
